@@ -2,7 +2,7 @@ import os
 from logging import getLogger
 
 from unstructured.partition.pdf_image.pdfminer_utils import init_pdfminer
-
+from superduper import model
 
 logger = getLogger(__name__)
 
@@ -88,6 +88,7 @@ def create_chunk_and_metadatas(page_elements, stride=3, window=10):
     return datas
 
 
+@model(flatten=True, model_update_kwargs={'document_embedded': False})
 def get_chunks(elements):
     from collections import defaultdict
     from unstructured.documents.coordinates import RelativeCoordinateSystem

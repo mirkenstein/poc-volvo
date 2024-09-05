@@ -4,19 +4,20 @@ import click
 import sentence_transformers
 from dotenv import load_dotenv
 from tqdm import tqdm
-from superduperdb import (
+from superduper import (
     Document,
     Listener,
-    Model,
+    model,
     Schema,
     VectorIndex,
     superduper,
     vector,
 )
-from superduperdb.backends.mongodb import Collection
-from superduperdb import logging
-from superduperdb.base.artifact import Artifact
-from superduperdb.ext.openai import OpenAIEmbedding
+from superduper.backends.mongodb import Collection
+from superduper import logging
+from superduper.base.artifact import Artifact
+from superduper.ext.openai import OpenAIEmbedding
+from superduper_sentence_transformers import SentenceTransformer
 
 from utils import get_chunks
 
@@ -26,13 +27,13 @@ load_dotenv()
 SOURCE_KEY = "elements"
 COLLECTION_NAME_SOURCE = "source"
 
-MODEL_IDENTIFIER_CHUNK = "chunk"
+MODEL_IDENTIFIER_CHUNK = "chunker"
 MODEL_IDENTIFIER_LLM = "llm"
 MODEL_IDENTIFIER_EMBEDDING = "text-embedding-ada-002"
 VECTOR_INDEX_IDENTIFIER = "vector-index"
 
-COLLECTION_NAME_CHUNK = f"_outputs.{SOURCE_KEY}.{MODEL_IDENTIFIER_CHUNK}"
-CHUNK_OUTPUT_KEY = f"_outputs.{SOURCE_KEY}.{MODEL_IDENTIFIER_CHUNK}"
+COLLECTION_NAME_CHUNK = f"_outputs.{MODEL_IDENTIFIER_CHUNK}"
+CHUNK_OUTPUT_KEY = f"_outputs.{MODEL_IDENTIFIER_CHUNK}"
 
 
 def _predict(self, X, one: bool = False, **kwargs):
@@ -63,8 +64,8 @@ def init_db():
 
 
 def save_pdfs(db, pdf_folder):
-    from superduperdb import Document
-    from superduperdb.ext.unstructured.encoder import unstructured_encoder
+    from superduper import Document
+    from superduper.ext.unstructured.encoder import unstructured_encoder
     from pdf2image import convert_from_path
 
     db.add(unstructured_encoder)
@@ -102,29 +103,37 @@ def save_pdfs(db, pdf_folder):
 
 
 def add_chunk_model(db):
-    chunk_model = Model(
-        identifier=MODEL_IDENTIFIER_CHUNK,
-        object=get_chunks,
-        flatten=True,
-        model_update_kwargs={"document_embedded": False},
-        output_schema=Schema(identifier="myschema", fields={"txt": "string"}),
+    upstream_listener = Listener(
+        model=get_chunks,
+        select=db[COLLECTION_NAME_SOURCE].select(), # "source"
+        key=SOURCE_KEY, # elements
+        uuid=MODEL_IDENTIFIER_CHUNK, #  "chunker"
+        identifier=MODEL_IDENTIFIER_CHUNK
     )
-
-    db.add(
-        Listener(
-            model=chunk_model,
-            select=Collection(COLLECTION_NAME_SOURCE).find(),
-            key="elements",
-        )
-    )
+    db.apply(upstream_listener)
+    # chunk_model = Model(
+    #     identifier=MODEL_IDENTIFIER_CHUNK,
+    #     object=get_chunks,
+    #     flatten=True,
+    #     model_update_kwargs={"document_embedded": False},
+    #     output_schema=Schema(identifier="myschema", fields={"txt": "string"}),
+    # )
+    #
+    # db.add(
+    #     Listener(
+    #         model=chunk_model,
+    #         select=Collection(COLLECTION_NAME_SOURCE).find(),
+    #         key="elements",
+    #     )
+    # )
 
 
 def add_vector_search_model(db, use_openai=False):
-    chunk_collection = Collection("_outputs.elements.chunk")
+    chunk_collection = db[COLLECTION_NAME_CHUNK]
 
     if use_openai:
-        from superduperdb.ext.openai import OpenAIEmbedding
-        from superduperdb.base.artifact import Artifact
+        from superduper_openai import OpenAIEmbedding
+        # from superduper.base.artifact import Artifact
 
         def preprocess(x):
             if isinstance(x, dict):
@@ -134,10 +143,10 @@ def add_vector_search_model(db, use_openai=False):
             return x
 
         # Create an instance of the OpenAIEmbedding model with the specified identifier ('text-embedding-ada-002')
-        model = OpenAIEmbedding(
+        embedding_model = OpenAIEmbedding(
             identifier=MODEL_IDENTIFIER_EMBEDDING,
             model="text-embedding-ada-002",
-            preprocess=Artifact(preprocess),
+            # preprocess=Artifact(preprocess),
         )
     else:
 
@@ -148,47 +157,51 @@ def add_vector_search_model(db, use_openai=False):
                 return "passage: " + chunk["txt"]
             return "query: " + x
 
-        model = Model(
+        embedding_model = SentenceTransformer(
             identifier=MODEL_IDENTIFIER_EMBEDDING,
             object=sentence_transformers.SentenceTransformer(
-                "intfloat/multilingual-e5-large"
+                "BAAI/bge-large-en-v1.5",
+                device="cuda"
             ),
-            encoder=vector(shape=(1024,)),
-            predict_method="encode",
-            preprocess=preprocess,
+            datatype=vector(shape=(1024,)),
+            device="cuda",
+            # predict_method="encode",
+            # preprocess=preprocess,
             postprocess=lambda x: x.tolist(),
             batch_predict=True,
+            predict_kwargs={"show_progress_bar": True},
         )
 
-    db.add(
+    vector_index = \
         VectorIndex(
             identifier=VECTOR_INDEX_IDENTIFIER,
             indexing_listener=Listener(
-                select=chunk_collection.find(),
+                select=chunk_collection.select(),
                 key=CHUNK_OUTPUT_KEY,  # Key for the documents
-                model=model,  # Specify the model for processing
+                model=embedding_model,  # Specify the model for processing
                 predict_kwargs={"max_chunk_size": 64},
+                uuid="embedding-bge-large",
             ),
         )
-    )
+    db.apply(vector_index)
 
 
 def vector_search(db, query, top_k=5):
     logging.info(f"Vector search query: {query}")
-    collection = Collection(COLLECTION_NAME_CHUNK)
+    chunk_collection = db[COLLECTION_NAME_CHUNK]
     out = db.execute(
-        collection.like(
+        chunk_collection.like(
             Document({CHUNK_OUTPUT_KEY: query}),
             vector_index=VECTOR_INDEX_IDENTIFIER,
             n=top_k,
-        ).find({})
+        ).select({})
     )
     if out:
-        out = sorted(out, key=lambda x: x.content["score"], reverse=True)
+        out = sorted(out, key=lambda x: x['score'], reverse=True)
     return out
 
 
-def add_llm_model(db, use_openai=False):
+def add_llm_model(db, use_openai=False,use_vllm=False):
     # Define the prompt for the llm model
     prompt_template = (
         "The following is a document and question about the volvo user manual\n"
@@ -199,22 +212,33 @@ def add_llm_model(db, use_openai=False):
     )
 
     if use_openai:
-        from superduperdb.ext.llm.openai import OpenAI
-
+        from superduper_openai import OpenAI
         llm = OpenAI(identifier=MODEL_IDENTIFIER_LLM, prompt_template=prompt_template)
 
-    else:
-        from superduperdb.ext.llm.vllm import VllmModel
-
+    elif use_vllm:
+        from superduper_vllm import VllmModel
         llm = VllmModel(
             identifier=MODEL_IDENTIFIER_LLM,
             model_name="TheBloke/Mistral-7B-Instruct-v0.2-AWQ",
-            prompt_template=prompt_template,
-            vllm_kwargs={"max_model_len": 2048, "quantization": "awq"},
-            inference_kwargs={"max_tokens": 2048},
+            prompt_func=prompt_template,
+            vllm_kwargs={
+                "gpu_memory_utilization": 0.50,
+                "max_model_len": 2048,
+                "quantization": "awq"
+            },
+            predict_kwargs={"max_tokens": 1024, "temperature": 0.8},
         )
+    else:
+        from superduper_anthropic import AnthropicCompletions
+        # os.environ["ANTHROPIC_API_KEY"] = ""
+        predict_kwargs = {
+            "max_tokens": 1024,
+            "temperature": 0.8,
+        }
+        llm = AnthropicCompletions(identifier='llm', model='claude-2.1', predict_kwargs=predict_kwargs)
+        # Ad
     # Add the llm instance
-    db.add(llm)
+    db.apply(llm)
 
 
 def qa(db, query, vector_search_top_k=5):
